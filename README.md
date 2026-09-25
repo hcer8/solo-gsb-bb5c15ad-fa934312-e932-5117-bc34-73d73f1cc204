@@ -1,6 +1,6 @@
-# 字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、主题片段检索与双语配对工具
+# 字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、主题片段检索、双语配对与重叠择优工具
 
-基于 **Python + FastAPI** 的轻量 Web 工具，包含八个功能页面：
+基于 **Python + FastAPI** 的轻量 Web 工具，包含九个功能页面：
 
 1. **字幕时间漂移校正**：粘贴 SRT 字幕，填入多组人工确认的「原时间 / 正确时间」
    锚点，按分段线性映射校正字幕时间，在网页预览并下载校正后的 SRT。
@@ -32,6 +32,13 @@
    单侧跳过，配对代价为两组时间跨度的起止差绝对值之和（合并每多一条加 500 毫秒、
    跳过每条加 3000 毫秒），同分按操作序列优先 1:1、1:2、2:1、跳过左、跳过右；
    页面展示每组序号、原文、跨度与代价及两侧未匹配条目，并下载 UTF-8 CSV。
+9. **重叠字幕择优保留**（<http://localhost:8000/selection>）：粘贴存在时间重叠
+   的 SRT，按字幕输入顺序（粘贴位置从 1 开始编号，与 SRT 自身序号无关）逐条设置
+   正整数**优先级**（未设置为 1）、填写**必须保留**的序号与非负**最小间隔毫秒数**；
+   原时间轴不移动，只保留相邻条目满足「前条结束 ＋ 最小间隔 ≤ 后条开始」的子序列，
+   在必须保留约束下最大化优先级总和（同分先取保留条数多、再取输入序号序列字典序
+   小）；必须保留条目彼此不兼容时返回冲突序号，页面展示保留 / 舍弃条目与总优先级，
+   并下载沿用原序号、原时间与原正文的保留 SRT。
 
 ## 功能与校正规则（时间漂移）
 
@@ -237,6 +244,37 @@
   或单侧跳过），含换行 / 逗号 / 双引号的正文按 CSV 规则整体加引号、内部引号
   翻倍转义，多行正文不会破坏行列结构。
 
+## 功能与择优规则（重叠字幕择优保留）
+
+- 输入 SRT（复用同一套字幕解析器）、按**字幕输入序号**（粘贴 SRT 中字幕出现
+  位置，从 1 开始编号，与字幕自身的 SRT 序号无关）设置的正整数**优先级**
+  `priorities`（未设置的条目优先级为 1）、**必须保留的序号** `required_orders`
+  以及非负整数 **最小间隔毫秒数** `min_gap_ms`。
+- **原时间轴不移动、不重排**：仅从输入字幕中选取一个**子序列**（保持输入顺序），
+  任意两条相邻被保留条目必须满足
+  **「前条结束 ＋ 最小间隔 ≤ 后条开始」**；首尾相接（前条结束恰为后条开始）在
+  最小间隔为 0 时允许，间隔要求大于 0 时不允许。
+- 选解目标依次为：**优先级总和最大 → 保留条数最多 → 保留条目输入序号序列字典序
+  最小**（第一个差异处取序号更靠前的方案）。动态规划以“最后一条被保留的字幕”
+  为状态，全程整数计算。
+- **必须保留约束**：`required_orders` 中的每条都必须出现在结果里；序号越界或
+  重复、优先级重复设置或非正整数均返回 `422`。
+- **必须保留条目彼此不兼容**（按输入顺序相邻的两条必须保留条目之间无法满足
+  最小间隔，中间选哪些条目都无法弥合）时返回 `422`（`detail.type` 为
+  `conflict`），`detail.conflicts` 列出全部冲突序号对：`earlier_order` /
+  `later_order`（均为输入序号）与两者的实际间隔 `gap_ms`（后条开始 − 前条
+  结束，可能为负）。
+- 成功返回 `kept` / `dropped`（按保留序列 / 输入顺序列出，各条含输入序号
+  `cue_order`、SRT 序号 `index`、起止时间、正文、`priority` 与 `required`
+  标记）、`kept_orders`、`kept_count` / `dropped_count` / `required_count`
+  与**保留条目总优先级** `total_priority`。
+- `selected_srt` 为**仅含保留条目**的 SRT：**沿用各条原来的 SRT 序号、原起止
+  时间码与原正文（不重新编号、不移动任何时间轴）**。页面以一张红 / 绿高亮总表
+  展示保留与舍弃条目、总优先级与保留序号序列，并可一键下载 `selected.srt`
+  （页面预览与下载同为接口返回的那一份）。`min_gap_ms` 不是非负整数、优先级
+  不是正整数或 SRT 无法解析时接口均返回 `422`（SRT 错误的 `detail.type`
+  为 `srt`，业务校验为 `selection`，必须保留冲突为 `conflict`）。
+
 ## 一条命令启动（Docker Compose）
 
 ```bash
@@ -253,6 +291,7 @@ docker compose up -d --build
 - 字幕章节规划界面：<http://localhost:8000/chapters>
 - 字幕主题短片段检索界面：<http://localhost:8000/topic-clip>
 - 双语字幕配对界面：<http://localhost:8000/bilingual-align>
+- 重叠字幕择优保留界面：<http://localhost:8000/selection>
 - 时间漂移接口：`POST` <http://localhost:8000/api/correct>
 - 位置规划接口：`POST` <http://localhost:8000/api/placement>
 - 阅读负荷接口：`POST` <http://localhost:8000/api/reading-load>
@@ -261,6 +300,7 @@ docker compose up -d --build
 - 章节规划接口：`POST` <http://localhost:8000/api/chapters>
 - 主题片段检索接口：`POST` <http://localhost:8000/api/topic-clip>
 - 双语字幕配对接口：`POST` <http://localhost:8000/api/bilingual-align>
+- 重叠字幕择优接口：`POST` <http://localhost:8000/api/selection>
 - 健康检查：<http://localhost:8000/health>
 - 接口文档（FastAPI 自带）：<http://localhost:8000/docs>
 
@@ -282,7 +322,8 @@ HOST_PORT=9000 docker compose up -d --build
 # 访问 http://localhost:9000/ 、http://localhost:9000/placement 、
 # http://localhost:9000/reading-load 、http://localhost:9000/terms 、
 # http://localhost:9000/wrap 、http://localhost:9000/chapters 、
-# http://localhost:9000/topic-clip 与 http://localhost:9000/bilingual-align
+# http://localhost:9000/topic-clip 、http://localhost:9000/bilingual-align
+# 与 http://localhost:9000/selection
 ```
 
 ## 不用 Docker，直接运行（Python 3.10+）
@@ -295,7 +336,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 同样访问 <http://localhost:8000/>、<http://localhost:8000/placement>、
 <http://localhost:8000/reading-load>、<http://localhost:8000/terms>、
 <http://localhost:8000/wrap>、<http://localhost:8000/chapters>、
-<http://localhost:8000/topic-clip> 与 <http://localhost:8000/bilingual-align>。
+<http://localhost:8000/topic-clip>、<http://localhost:8000/bilingual-align>
+与 <http://localhost:8000/selection>。
 
 ## HTTP 接口
 
@@ -519,12 +561,44 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 跳过右。任一侧 SRT 解析失败返回 `422`（`detail.type` 为 `srt`，
 `detail.message` 以「左侧字幕：… / 右侧字幕：…」指明侧别）。
 
+### `POST /api/selection`
+
+```json
+{
+  "srt": "1\n00:00:00,000 --> 00:00:02,000\n第一句\n\n2\n00:00:01,000 --> 00:00:03,000\n重叠的第二句\n",
+  "priorities": [
+    {"order": 2, "priority": 5}
+  ],
+  "required_orders": [],
+  "min_gap_ms": 0
+}
+```
+
+`priorities` / `required_orders` 均可省略或传空数组；`priorities` 每项按
+**输入序号** `order`（从 1 开始）把该条优先级 `priority` 设为正整数，未列出的
+条目优先级为 1，同一序号重复设置返回 `422`；`required_orders` 为必须保留的
+输入序号（去重，越界 / 重复返回 `422`）；`min_gap_ms` 为非负整数。成功返回：
+
+- `kept` / `dropped`：保留（按保留序列顺序）与舍弃（按输入顺序）条目，各含
+  `cue_order`（输入序号）、`index`（原 SRT 序号）、`start` / `end`
+  （`HH:MM:SS,mmm`）、`text`、`priority` 与 `required` 标记；
+- `kept_orders`：保留条目的输入序号序列；`kept_count` / `dropped_count` /
+  `required_count` 与保留条目总优先级 `total_priority`；
+- `selected_srt`：仅含保留条目的 SRT，**沿用各条原 SRT 序号、原起止时间码与
+  原正文，不重新编号、不移动时间轴**。
+
+选解依次按「优先级总和最大 → 保留条数最多 → 输入序号序列字典序最小」。
+**必须保留条目彼此不兼容**（相邻必须保留条目满足不了「前条结束 ＋ 最小间隔
+≤ 后条开始」）时返回 `422`，`detail.type` 为 `conflict`，`detail.conflicts`
+列出全部冲突对（`earlier_order` / `later_order` / `gap_ms`）；业务参数非法
+时 `detail.type` 为 `selection`，SRT 解析失败时为 `srt`。
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load、/api/terms、/api/wrap、/api/chapters、/api/topic-clip 与 /api/bilingual-align 接口
+│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load、/api/terms、/api/wrap、/api/chapters、/api/topic-clip、/api/bilingual-align 与 /api/selection 接口
 │   ├── mapping.py        # 锚点校验与分段线性映射
 │   ├── placement.py      # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
 │   ├── reading_load.py   # 字 / 秒速率、半开时间轴事件扫描、热区合并与最短时长过滤
@@ -533,6 +607,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── chapters.py       # 章节切分可行性校验与均衡切分 DP（时长偏差平方 + 停顿缺口平方）
 │   ├── topic_clip.py     # 关键词 casefold 命中、开始时间非递减校验与最短连续窗口滑动检索
 │   ├── bilingual.py      # 双语字幕单调配对 DP（1:1 / 1:2 / 2:1 与单侧跳过、操作序列同分裁决）
+│   ├── selection.py      # 重叠字幕择优保留 DP（最小间隔、必须保留约束、优先级总和 / 条数 / 序号字典序裁决）
 │   ├── srt.py            # SRT 解析、正文行定位与无损重写（保留原格式）
 │   ├── timecode.py       # 时间码解析与格式化（SRT / WebVTT）
 │   └── static/
@@ -543,7 +618,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │       ├── wrap.html          # 字幕智能断行页面（原生 HTML/CSS/JS）
 │       ├── chapters.html      # 字幕章节规划页面（原生 HTML/CSS/JS）
 │       ├── topic_clip.html    # 字幕主题短片段检索页面（原生 HTML/CSS/JS）
-│       └── bilingual_align.html  # 双语字幕配对页面（原生 HTML/CSS/JS）
+│       ├── bilingual_align.html  # 双语字幕配对页面（原生 HTML/CSS/JS）
+│       └── selection.html     # 重叠字幕择优保留页面（原生 HTML/CSS/JS）
 ├── tests/               # 核心算法与接口测试
 ├── Dockerfile
 ├── docker-compose.yml

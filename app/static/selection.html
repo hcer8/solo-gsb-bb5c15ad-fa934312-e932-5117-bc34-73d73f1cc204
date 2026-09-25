@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>重叠字幕择优保留</title>
+<style>
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --border: #d9dee8;
+    --text: #1f2733;
+    --muted: #6b7686;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --danger: #dc2626;
+    --danger-bg: #fef2f2;
+    --ok-bg: #f0fdf4;
+    --ok-border: #16a34a;
+    --keep-bg: #f0fdf4;
+    --drop-bg: #fef2f2;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 64px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .nav { margin: 0 0 16px; font-size: 14px; }
+  .nav a { color: var(--primary); text-decoration: none; margin-right: 16px; }
+  .nav a:hover { text-decoration: underline; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .hint { color: var(--muted); font-weight: 400; font-size: 13px; }
+  textarea {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 13px/1.6 var(--mono);
+    resize: vertical;
+  }
+  #srt { min-height: 220px; }
+  textarea:focus, input:focus { outline: 2px solid rgba(37, 99, 235, .35); border-color: var(--primary); }
+  .params { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-end; }
+  .params .field { width: 240px; }
+  input[type="number"] {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: 14px var(--mono);
+  }
+  button {
+    border: 1px solid var(--border);
+    background: #fff;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #f1f4f9; }
+  button.primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+    font-weight: 600;
+    padding: 10px 22px;
+  }
+  button.primary:hover { background: var(--primary-hover); }
+  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  .alert {
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    white-space: pre-wrap;
+  }
+  .alert.error { background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger); }
+  .alert.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: #166534; }
+  .hidden { display: none; }
+  table.cues { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  table.cues th, table.cues td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.cues th { background: #f8fafc; }
+  table.cues td.num { width: 52px; color: var(--muted); text-align: right; }
+  table.cues td.tc { font-family: var(--mono); white-space: nowrap; }
+  table.cues td.rate { font-family: var(--mono); text-align: right; white-space: nowrap; width: 64px; }
+  table.cues td.tag { width: 80px; text-align: center; }
+  tr.keep td { background: var(--keep-bg); }
+  tr.drop td { background: var(--drop-bg); }
+  .tag {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 1px 10px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .tag.keep { background: #dcfce7; color: #166534; }
+  .tag.drop { background: #fee2e2; color: #991b1b; }
+  .tag.req { background: #fef9c3; color: #854d0e; }
+  .preview {
+    width: 100%;
+    max-height: 320px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 12px/1.6 var(--mono);
+    background: #fafbfc;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .summary { font-size: 15px; }
+  .summary b { font-size: 17px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="nav">
+    <a href="/">字幕时间漂移校正</a>
+    <a href="/placement">字幕位置规划</a>
+    <a href="/reading-load">阅读负荷热区</a>
+    <a href="/terms">字幕专名统一</a>
+    <a href="/wrap">字幕智能断行</a>
+    <a href="/chapters">字幕章节规划</a>
+    <a href="/topic-clip">主题短片段检索</a>
+    <a href="/bilingual-align">双语字幕配对</a>
+  </p>
+  <h1>重叠字幕择优保留</h1>
+  <p class="sub">粘贴存在时间重叠的 SRT，按字幕输入顺序（粘贴位置从 1 开始编号，与 SRT 自身序号无关）
+    设置每条的<b>优先级</b>（正整数，未设置为 1）、<b>必须保留</b>的序号与相邻保留条目的<b>最小间隔毫秒数</b>。
+    原时间轴不移动，仅保留满足「前条结束 ＋ 最小间隔 ≤ 后条开始」的子序列，并在必须保留约束下最大化优先级总和；
+    总分相同时先取保留条数更多者，再取保留输入序号序列字典序更小者。必须保留条目彼此不兼容时返回冲突序号。</p>
+
+  <div class="card">
+    <label for="srt">原始 SRT 字幕</label>
+    <textarea id="srt" placeholder="1&#10;00:00:00,000 --> 00:00:02,000&#10;第一句字幕&#10;&#10;2&#10;00:00:01,500 --> 00:00:04,000&#10;与第一条重叠的字幕"></textarea>
+  </div>
+
+  <div class="card">
+    <h2>择优参数
+      <span class="hint">序号均指字幕在粘贴 SRT 中的输入顺序（从 1 开始）；间隔按毫秒整数计算</span>
+    </h2>
+    <div class="params" style="margin-bottom: 16px;">
+      <div class="field">
+        <label for="minGap">最小间隔毫秒数（非负整数）</label>
+        <input type="number" id="minGap" min="0" step="1" value="0">
+      </div>
+      <button type="button" id="fillExample">填入示例</button>
+    </div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap;">
+      <div style="flex:1;min-width:280px;">
+        <label for="priorities">优先级设置
+          <span class="hint">每行一条「序号 优先级」，空格 / 冒号 / 等号分隔；留空行忽略，未列出的序号优先级为 1</span>
+        </label>
+        <textarea id="priorities" style="min-height:120px;" placeholder="2 5&#10;4:3&#10;7=10"></textarea>
+      </div>
+      <div style="flex:1;min-width:280px;">
+        <label for="requiredOrders">必须保留的序号
+          <span class="hint">序号、空格 / 逗号 / 顿号分隔均可；序号不能重复，彼此须能同时满足间隔约束</span>
+        </label>
+        <textarea id="requiredOrders" style="min-height:120px;" placeholder="1, 3, 7"></textarea>
+      </div>
+    </div>
+  </div>
+
+  <div id="errorBox" class="alert error hidden"></div>
+
+  <div class="toolbar" style="margin-bottom: 20px;">
+    <button type="button" class="primary" id="submit">择优保留</button>
+    <span class="hint" id="status"></span>
+  </div>
+
+  <div id="resultCard" class="card hidden">
+    <h2>择优结果</h2>
+    <div id="okBox" class="alert ok hidden"></div>
+    <div class="toolbar" style="margin-top:0;">
+      <button type="button" class="primary" id="download">下载 selected.srt</button>
+      <span class="hint">导出仅含保留条目的 SRT：沿用各自原 SRT 序号、原起止时间与原正文，时间轴不移动。</span>
+    </div>
+
+    <h2 style="margin-top:18px;">全部字幕（<span id="keepTitle"></span> 绿色保留 / <span id="dropTitle"></span> 红色舍弃）</h2>
+    <table class="cues">
+      <thead>
+        <tr>
+          <th>输入序号</th>
+          <th>SRT 序号</th>
+          <th>开始</th>
+          <th>结束</th>
+          <th>优先级</th>
+          <th>状态</th>
+          <th>正文</th>
+        </tr>
+      </thead>
+      <tbody id="cueRows"></tbody>
+    </table>
+
+    <h2 style="margin-top:18px;">保留 SRT 预览</h2>
+    <pre class="preview" id="srtPreview"></pre>
+  </div>
+</div>
+
+<script>
+(function () {
+  const srtEl = document.getElementById("srt");
+  const minGapEl = document.getElementById("minGap");
+  const prioritiesEl = document.getElementById("priorities");
+  const requiredEl = document.getElementById("requiredOrders");
+  const errorBox = document.getElementById("errorBox");
+  const resultCard = document.getElementById("resultCard");
+  const okBox = document.getElementById("okBox");
+  const cueRowsEl = document.getElementById("cueRows");
+  const srtPreviewEl = document.getElementById("srtPreview");
+  const keepTitleEl = document.getElementById("keepTitle");
+  const dropTitleEl = document.getElementById("dropTitle");
+  const statusEl = document.getElementById("status");
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.classList.remove("hidden");
+  }
+  function clearAlerts() {
+    errorBox.classList.add("hidden");
+    okBox.classList.add("hidden");
+    errorBox.textContent = "";
+    okBox.textContent = "";
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  // 解析优先级文本：每行「序号 优先级」，分隔符为空白 / 冒号 / 等号
+  function parsePriorities(text) {
+    const rules = [];
+    const lines = text.split(/\r\n|\r|\n/);
+    for (let raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      const m = line.match(/^(\d+)\s*[\s:=]\s*(\d+)$/);
+      if (!m) {
+        return { error: "优先级设置中无法识别的一行：「" + raw + "」；格式应为「序号 优先级」，如 2 5。" };
+      }
+      rules.push({ order: Number(m[1]), priority: Number(m[2]) });
+    }
+    return { rules };
+  }
+
+  // 必须保留序号：数字之间可用空白 / 逗号 / 顿号 / 分号 / 换行分隔
+  function parseRequired(text) {
+    const orders = [];
+    const tokens = text.split(/[\s,，、;；]+/).filter(Boolean);
+    for (const tok of tokens) {
+      if (!/^\d+$/.test(tok)) {
+        return { error: "必须保留序号中无法识别：「" + tok + "」；请填写正整数序号。" };
+      }
+      orders.push(Number(tok));
+    }
+    return { orders };
+  }
+
+  const EXAMPLE_SRT =
+    "1\n00:00:00,000 --> 00:00:02,500\n大家好，欢迎收看本期节目\n\n" +
+    "2\n00:00:02,000 --> 00:00:05,000\n（重叠版）欢迎收看今天的节目\n\n" +
+    "3\n00:00:05,000 --> 00:00:08,000\n首先关注一条科技新闻\n\n" +
+    "4\n00:00:07,000 --> 00:00:10,500\n（重叠版）先来关注科技方面的消息\n\n" +
+    "5\n00:00:10,500 --> 00:00:13,000\n以上就是今天的主要内容\n";
+
+  document.getElementById("fillExample").addEventListener("click", () => {
+    srtEl.value = EXAMPLE_SRT;
+    prioritiesEl.value = "2 5\n4 5";
+    requiredEl.value = "";
+    minGapEl.value = 0;
+    clearAlerts();
+    resultCard.classList.add("hidden");
+  });
+
+  function render(data) {
+    const prioMap = {};
+    for (const c of data.kept.concat(data.dropped)) prioMap[c.cue_order] = c.priority;
+    const keptSet = new Set(data.kept_orders);
+
+    cueRowsEl.innerHTML = data.kept.concat(data.dropped)
+      .sort((a, b) => a.cue_order - b.cue_order)
+      .map(c => {
+        const kept = keptSet.has(c.cue_order);
+        const tags = (kept ? '<span class="tag keep">保留</span>' : '<span class="tag drop">舍弃</span>') +
+          (c.required ? ' <span class="tag req">必须保留</span>' : "");
+        return '<tr class="' + (kept ? "keep" : "drop") + '">' +
+          '<td class="num">' + c.cue_order + "</td>" +
+          '<td class="num">' + escapeHtml(c.index) + "</td>" +
+          '<td class="tc">' + escapeHtml(c.start) + "</td>" +
+          '<td class="tc">' + escapeHtml(c.end) + "</td>" +
+          '<td class="rate">' + c.priority + "</td>" +
+          '<td class="tag">' + tags + "</td>" +
+          "<td>" + escapeHtml(c.text).replace(/\n/g, "<br>") + "</td>" +
+          "</tr>";
+      }).join("");
+
+    keepTitleEl.textContent = data.kept_count;
+    dropTitleEl.textContent = data.dropped_count;
+    srtPreviewEl.textContent = data.selected_srt;
+
+    okBox.textContent =
+      "共 " + data.cue_count + " 条字幕：保留 " + data.kept_count +
+      " 条、舍弃 " + data.dropped_count + " 条（其中必须保留 " + data.required_count +
+      " 条），保留条目总优先级为 " + data.total_priority + "（最小间隔 " +
+      data.min_gap_ms + " ms）。保留序号序列：" +
+      (data.kept_orders.length ? data.kept_orders.join(" → ") : "（空）") + "。";
+    okBox.classList.remove("hidden");
+  }
+
+  document.getElementById("submit").addEventListener("click", async () => {
+    clearAlerts();
+    resultCard.classList.add("hidden");
+
+    const rawGap = minGapEl.value.trim();
+    if (!/^\d+$/.test(rawGap)) {
+      showError("最小间隔毫秒数必须是非负整数，例如 0、500。");
+      return;
+    }
+    const pri = parsePriorities(prioritiesEl.value);
+    if (pri.error) { showError(pri.error); return; }
+    const req = parseRequired(requiredEl.value);
+    if (req.error) { showError(req.error); return; }
+
+    statusEl.textContent = "择优计算中…";
+    try {
+      const resp = await fetch("/api/selection", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          srt: srtEl.value,
+          priorities: pri.rules,
+          required_orders: req.orders,
+          min_gap_ms: Number(rawGap)
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        let message = (data.detail && data.detail.message) || ("请求失败（HTTP " + resp.status + "）");
+        if (data.detail && data.detail.type === "conflict" && data.detail.conflicts) {
+          message += "\n冲突序号对：" + data.detail.conflicts.map(p =>
+            p.earlier_order + " 与 " + p.later_order + "（间隔 " + p.gap_ms + " ms）").join("、") + "。";
+        }
+        showError(message);
+        statusEl.textContent = "";
+        return;
+      }
+
+      // 页面预览与下载共用接口返回的同一份 selected_srt
+      window.__selectedSrt = data.selected_srt;
+      render(data);
+      resultCard.classList.remove("hidden");
+      statusEl.textContent = "";
+    } catch (err) {
+      showError("请求出错：" + err);
+      statusEl.textContent = "";
+    }
+  });
+
+  document.getElementById("download").addEventListener("click", () => {
+    const content = window.__selectedSrt || "";
+    const blob = new Blob([content], { type: "application/x-subrip;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "selected.srt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>

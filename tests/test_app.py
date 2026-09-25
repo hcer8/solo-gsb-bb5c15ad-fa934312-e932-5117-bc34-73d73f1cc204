@@ -35,6 +35,12 @@ from app.placement import (
     plan_positions,
 )
 from app.reading_load import count_display_chars, find_reading_zones
+from app.selection import (
+    ConflictPair,
+    SelectionConflict,
+    SelectionError,
+    select_cues,
+)
 from app.srt import BOM, Cue, SrtParseError, format_srt, parse_document, parse_srt, rewrite_srt
 from app.terms import TermError, TermRule, apply_terms, build_rules, scan_line
 from app.timecode import format_timecode, parse_timecode
@@ -2209,3 +2215,289 @@ def test_api_bilingual_align_requires_fields():
     assert client.post(
         "/api/bilingual-align", json={"right_srt": ALIGN_RIGHT}
     ).status_code == 422
+
+
+# ---------- 重叠字幕择优保留 ----------
+
+def _sel_cue(i, start, end):
+    return Cue(str(i), start, end, f"t{i}")
+
+
+def test_select_default_priority_keeps_longest_compatible_chain():
+    # 1 与 2 重叠；默认优先级全为 1 时取最长链，等长取序号序列字典序小
+    cues = [
+        _sel_cue(1, 0, 2000),
+        _sel_cue(2, 1000, 3000),
+        _sel_cue(3, 3000, 5000),
+    ]
+    plan = select_cues(cues, [], [], 0)
+    assert plan.kept_orders == (1, 3)
+    assert plan.total_priority == 2
+
+
+def test_select_min_gap_uses_end_plus_gap_leq_start():
+    cues = [
+        _sel_cue(1, 0, 1000),
+        _sel_cue(2, 1000, 2000),  # 与 1 首尾相接
+    ]
+    assert select_cues(cues, [], [], 0).kept_orders == (1, 2)
+    plan = select_cues(cues, [], [], 1)
+    assert plan.kept_orders == (1,)
+    assert plan.total_priority == 1
+
+
+def test_select_max_priority_over_count():
+    # [1,3] 两条总优先级 2；[2,3] 两条总优先级 6；[2] 一条但 5 < 6
+    cues = [
+        _sel_cue(1, 0, 2000),
+        _sel_cue(2, 1000, 3000),
+        _sel_cue(3, 3000, 4000),
+    ]
+    plan = select_cues(cues, [(2, 5)], [], 0)
+    assert plan.kept_orders == (2, 3)
+    assert plan.total_priority == 6
+
+
+def test_select_same_total_prefers_more_cues():
+    # 1、2 互斥且各自与 3 相接：取 2 单链 [2,3] 总分 3（2 条），
+    # 不取 2 时 [1,3] 总分 2 但条数同为 2、[3] 仅 1 条——构造真正同分：
+    # 令 2 的优先级为 2，则 [2,3]（2+1=3，2 条）与“只取 1 条高优先级”不可比，
+    # 这里改为单条 [2]=3 与两条 [1,3]=1+2=3 同分 -> 条数多的 [1,3] 胜
+    cues = [
+        _sel_cue(1, 0, 2000),
+        _sel_cue(2, 1000, 4000),  # 与 1、3 都冲突
+        _sel_cue(3, 3000, 5000),
+    ]
+    plan = select_cues(cues, [(2, 3), (3, 2)], [], 0)
+    assert plan.kept_orders == (1, 3)
+    assert plan.total_priority == 3
+    assert len(plan.kept_orders) == 2
+
+
+def test_select_tie_breaks_by_order_sequence_lexicographic():
+    # [1,3] 与 [2,4] 都是两条、总分 2；字典序小者 [1,3]
+    cues = [
+        _sel_cue(1, 0, 100),
+        _sel_cue(2, 50, 150),
+        _sel_cue(3, 200, 300),
+        _sel_cue(4, 250, 350),
+    ]
+    plan = select_cues(cues, [], [], 0)
+    assert plan.kept_orders == (1, 3)
+
+
+def test_select_required_orders_must_all_be_kept():
+    # 必须保留 2：1 与 2 互斥，故 [1,3] 被排除，只能 [2,3]
+    plan = select_cues(
+        [
+            _sel_cue(1, 0, 2000),
+            _sel_cue(2, 1000, 3000),
+            _sel_cue(3, 3000, 4000),
+        ],
+        [],
+        [2],
+        0,
+    )
+    assert plan.kept_orders == (2, 3)
+    # 必须保留 2 且最小间隔 1000ms：3 与 2 仅相接（间隔 0），只能保留 [2]
+    plan = select_cues(
+        [
+            _sel_cue(1, 0, 2000),
+            _sel_cue(2, 1000, 3000),
+            _sel_cue(3, 3000, 4000),
+        ],
+        [],
+        [2],
+        1000,
+    )
+    assert plan.kept_orders == (2,)
+
+
+def test_select_required_conflict_reports_pairs():
+    cues = [
+        _sel_cue(1, 0, 2000),
+        _sel_cue(2, 1000, 3000),  # 与 1 重叠
+        _sel_cue(3, 3000, 4000),
+        _sel_cue(4, 3500, 4500),  # 与 3 重叠
+    ]
+    with pytest.raises(SelectionConflict) as exc_info:
+        select_cues(cues, [], [1, 2, 3, 4], 0)
+    pairs = exc_info.value.pairs
+    assert pairs == (
+        ConflictPair(earlier_order=1, later_order=2, gap_ms=-1000),
+        ConflictPair(earlier_order=3, later_order=4, gap_ms=-500),
+    )
+    # 间隔拉大后原本相接的条目也会冲突
+    with pytest.raises(SelectionConflict):
+        select_cues(
+            [_sel_cue(1, 0, 1000), _sel_cue(2, 1000, 2000)], [], [1, 2], 1
+        )
+
+
+def test_select_validates_ranges_and_duplicates():
+    cues = [_sel_cue(1, 0, 1000)]
+    with pytest.raises(SelectionError):
+        select_cues(cues, [(2, 1)], [], 0)
+    with pytest.raises(SelectionError):
+        select_cues(cues, [(1, 0)], [], 0)
+    with pytest.raises(SelectionError):
+        select_cues(cues, [(1, 1), (1, 2)], [], 0)
+    with pytest.raises(SelectionError):
+        select_cues(cues, [], [2], 0)
+    with pytest.raises(SelectionError):
+        select_cues(cues, [], [1, 1], 0)
+    with pytest.raises(SelectionError):
+        select_cues(cues, [], [], -1)
+
+
+def test_select_matches_bruteforce_on_random():
+    def brute(cues, weights, required, gap):
+        n = len(cues)
+        best = None
+        for mask in range(1 << n):
+            sel = tuple(i for i in range(n) if mask >> i & 1)
+            if not sel:
+                continue
+            if not all(r in sel for r in required):
+                continue
+            if any(cues[a].end + gap > cues[b].start for a, b in zip(sel, sel[1:])):
+                continue
+            cand = (sum(weights[i] for i in sel), len(sel), tuple(-(i + 1) for i in sel))
+            if best is None or cand > best:
+                best = cand
+        return best
+
+    rng = random.Random(7)
+    for _ in range(400):
+        n = rng.randint(1, 8)
+        cues = []
+        t = 0
+        for i in range(n):
+            t = t + rng.randint(-2, 4)
+            cues.append(Cue(str(i + 1), t, t + rng.randint(1, 5), "x"))
+        gap = rng.randint(0, 4)
+        weights = [rng.randint(1, 3) for _ in range(n)]
+        pri = [(i + 1, w) for i, w in enumerate(weights)]
+        required = sorted(rng.sample(range(1, n + 1), rng.randint(0, n)))
+        try:
+            plan = select_cues(cues, pri, required, gap)
+        except SelectionConflict:
+            continue
+        best = brute(cues, weights, [r - 1 for r in required], gap)
+        assert best is not None
+        assert plan.total_priority == best[0]
+        assert len(plan.kept_orders) == best[1]
+        assert tuple(-x for x in plan.kept_orders) == best[2]
+
+
+SELECTION_SRT = (
+    "1\n00:00:00,000 --> 00:00:02,000\n第一句\n\n"
+    "2\n00:00:01,000 --> 00:00:03,000\n重叠的第二句\n\n"
+    "3\n00:00:03,000 --> 00:00:05,000\n第三句\n"
+)
+
+
+def selection_body(**overrides):
+    body = {"srt": SELECTION_SRT, "priorities": [], "required_orders": [], "min_gap_ms": 0}
+    body.update(overrides)
+    return body
+
+
+def test_selection_page_served():
+    resp = client.get("/selection")
+    assert resp.status_code == 200
+    assert "重叠字幕择优保留" in resp.text
+    assert "/api/selection" in resp.text
+
+
+def test_api_selection_success_and_srt_export():
+    resp = client.post(
+        "/api/selection",
+        json=selection_body(priorities=[{"order": 2, "priority": 5}]),
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["kept_orders"] == [2, 3]
+    assert data["kept_count"] == 2
+    assert data["dropped_count"] == 1
+    assert data["total_priority"] == 6
+    assert [c["cue_order"] for c in data["kept"]] == [2, 3]
+    assert [c["cue_order"] for c in data["dropped"]] == [1]
+    assert data["kept"][0]["index"] == "2"
+    assert data["kept"][0]["priority"] == 5
+    assert data["kept"][1]["priority"] == 1
+    assert data["kept"][0]["required"] is False
+
+    # 导出 SRT 保留原序号、原时间与正文，时间轴不移动
+    assert data["selected_srt"] == (
+        "2\n00:00:01,000 --> 00:00:03,000\n重叠的第二句\n\n"
+        "3\n00:00:03,000 --> 00:00:05,000\n第三句\n"
+    )
+
+
+def test_api_selection_required_and_flags():
+    # 必须保留 2（与 1 重叠）：1 被舍弃，2 与 3 相接可同留（间隔 0）
+    resp = client.post(
+        "/api/selection", json=selection_body(required_orders=[2], min_gap_ms=0)
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["kept_orders"] == [2, 3]
+    assert data["required_count"] == 1
+    assert {c["cue_order"]: c["required"] for c in data["kept"]} == {
+        2: True,
+        3: False,
+    }
+
+
+def test_api_selection_conflict_returns_conflicting_orders():
+    resp = client.post("/api/selection", json=selection_body(required_orders=[1, 2]))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["type"] == "conflict"
+    assert detail["conflicts"] == [
+        {"earlier_order": 1, "later_order": 2, "gap_ms": -1000}
+    ]
+    assert "1" in detail["message"] and "2" in detail["message"]
+
+
+def test_api_selection_rejects_bad_srt():
+    resp = client.post("/api/selection", json=selection_body(srt="garbage"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+def test_api_selection_rejects_out_of_range_and_duplicate_orders():
+    resp = client.post("/api/selection", json=selection_body(required_orders=[9]))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "selection"
+
+    resp = client.post(
+        "/api/selection",
+        json=selection_body(priorities=[{"order": 2, "priority": 1},
+                                        {"order": 2, "priority": 3}]),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "selection"
+
+    resp = client.post("/api/selection", json=selection_body(required_orders=[1, 1]))
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("bad_value", [-1, -100])
+def test_api_selection_rejects_negative_gap(bad_value):
+    resp = client.post("/api/selection", json=selection_body(min_gap_ms=bad_value))
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, 1.5])
+def test_api_selection_rejects_bad_priority(bad_value):
+    resp = client.post(
+        "/api/selection",
+        json=selection_body(priorities=[{"order": 1, "priority": bad_value}]),
+    )
+    assert resp.status_code == 422
+
+
+def test_api_selection_requires_fields():
+    assert client.post("/api/selection", json={}).status_code == 422

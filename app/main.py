@@ -29,7 +29,8 @@ from .placement import (
 )
 from . import linewrap, terms as terms_lib
 from .reading_load import find_reading_zones
-from .srt import Cue, SrtParseError, parse_document, parse_srt, rewrite_srt
+from .selection import SelectionConflict, SelectionError, select_cues
+from .srt import Cue, SrtParseError, format_srt, parse_document, parse_srt, rewrite_srt
 from .timecode import format_signed_timecode, format_timecode
 from .topic_clip import (
     TopicClipError,
@@ -41,13 +42,14 @@ from .topic_clip import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、主题片段检索与双语配对工具",
+    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、主题片段检索、双语配对与重叠择优工具",
     description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置、"
     "统一专名别名、分析重叠字幕叠加后的阅读负荷热区、按列数 / 行数限制智能断行、"
     "按章节数与优选停顿把整段字幕切成时长均衡的连续章节、"
-    "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段，"
-    "或把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对。",
-    version="1.7.0",
+    "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段、"
+    "把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对，"
+    "或在原时间轴不动的前提下按优先级与最小间隔从重叠字幕中择优保留。",
+    version="1.8.0",
 )
 
 _FIELD_LABELS = {
@@ -58,6 +60,7 @@ _FIELD_LABELS = {
     "max_lines": "每条字幕最多行数",
     "chapter_count": "章节数",
     "preferred_pause_ms": "优选停顿（毫秒）",
+    "min_gap_ms": "最小间隔（毫秒）",
     "keywords": "关键词",
     "required_count": "关键词所需字幕条数",
     "left_srt": "左侧 SRT 内容",
@@ -88,6 +91,10 @@ async def validation_exception_handler(
         elif err.get("type") == "greater_than_equal":
             if field in ("max_columns", "max_lines", "chapter_count", "required_count"):
                 message = f"{label}必须为正整数（不小于 1）。"
+            elif field == "priority":
+                message = "优先级必须为正整数（不小于 1），未设置时默认为 1。"
+            elif field == "order":
+                message = "字幕输入序号必须为正整数（不小于 1）。"
             else:
                 message = f"{label}不能小于 0。"
         elif err.get("type") == "too_short":
@@ -423,6 +430,52 @@ class BilingualAlignResponse(BaseModel):
     unmatched_right: list[UnmatchedCueView]
 
 
+class PriorityRuleIn(BaseModel):
+    order: StrictInt = Field(..., ge=1, description="字幕输入序号（按粘贴 SRT 中的出现位置，从 1 开始）")
+    priority: StrictInt = Field(..., ge=1, description="该条字幕的优先级（正整数），未设置默认为 1")
+
+
+class SelectionRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    priorities: list[PriorityRuleIn] = Field(
+        default_factory=list, description="按字幕输入序号设置的优先级（正整数），未设置为 1"
+    )
+    required_orders: list[StrictInt] = Field(
+        default_factory=list,
+        description="必须保留的字幕输入序号列表（从 1 开始）；越界 / 重复由接口业务校验拒绝",
+    )
+    min_gap_ms: StrictInt = Field(..., ge=0, description="相邻保留条目的最小间隔（非负整数毫秒）")
+
+
+class SelectionCueView(BaseModel):
+    cue_order: int
+    index: str
+    start: str
+    end: str
+    text: str
+    priority: int
+    required: bool
+
+
+class ConflictPairView(BaseModel):
+    earlier_order: int
+    later_order: int
+    gap_ms: int
+
+
+class SelectionResponse(BaseModel):
+    min_gap_ms: int
+    cue_count: int
+    kept_count: int
+    dropped_count: int
+    required_count: int
+    total_priority: int
+    kept_orders: list[int]
+    kept: list[SelectionCueView]
+    dropped: list[SelectionCueView]
+    selected_srt: str
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -466,6 +519,11 @@ def topic_clip_page() -> FileResponse:
 @app.get("/bilingual-align")
 def bilingual_align_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "bilingual_align.html")
+
+
+@app.get("/selection")
+def selection_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "selection.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -929,4 +987,76 @@ def bilingual_align(req: BilingualAlignRequest) -> BilingualAlignResponse | JSON
         pairs=pair_views,
         unmatched_left=unmatched_views(left_cues, result.skipped_left),
         unmatched_right=unmatched_views(right_cues, result.skipped_right),
+    )
+
+
+@app.post("/api/selection", response_model=SelectionResponse)
+def selection(req: SelectionRequest) -> SelectionResponse | JSONResponse:
+    # 1. 复用同一套 SRT 解析器（保留原始序号、时间与正文）
+    try:
+        cues = parse_srt(req.srt)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    priorities = [(rule.order, rule.priority) for rule in req.priorities]
+
+    # 2. 序号越界 / 重复、优先级非正（字段校验已兜底）返回 422；
+    #    必须保留条目彼此不兼容时 422 返回所有冲突序号对（detail.type=conflict）
+    try:
+        plan = select_cues(cues, priorities, list(req.required_orders), req.min_gap_ms)
+    except SelectionConflict as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "type": "conflict",
+                "message": str(exc),
+                "conflicts": [
+                    {
+                        "earlier_order": p.earlier_order,
+                        "later_order": p.later_order,
+                        "gap_ms": p.gap_ms,
+                    }
+                    for p in exc.pairs
+                ],
+            },
+        )
+    except SelectionError as exc:
+        raise HTTPException(
+            status_code=422, detail={"type": "selection", "message": str(exc)}
+        )
+
+    kept_set = set(plan.kept_orders)
+    required_set = set(req.required_orders)
+    weights = {order: value for order, value in priorities}
+
+    def cue_view(order: int) -> SelectionCueView:
+        cue = cues[order - 1]
+        return SelectionCueView(
+            cue_order=order,
+            index=cue.index,
+            start=format_timecode(cue.start),
+            end=format_timecode(cue.end),
+            text=cue.text,
+            priority=weights.get(order, 1),
+            required=order in required_set,
+        )
+
+    kept_views = [cue_view(order) for order in plan.kept_orders]
+    dropped_views = [cue_view(i) for i in range(1, len(cues) + 1) if i not in kept_set]
+
+    # 3. 原时间轴不移动：导出的 SRT 只包含保留条目，沿用各自原序号、
+    #    原起止时间码与原正文（重新编号关闭，序号即粘贴 SRT 中的原序号）
+    selected_srt = format_srt([cues[order - 1] for order in plan.kept_orders])
+
+    return SelectionResponse(
+        min_gap_ms=req.min_gap_ms,
+        cue_count=len(cues),
+        kept_count=len(kept_views),
+        dropped_count=len(dropped_views),
+        required_count=len(required_set),
+        total_priority=plan.total_priority,
+        kept_orders=list(plan.kept_orders),
+        kept=kept_views,
+        dropped=dropped_views,
+        selected_srt=selected_srt,
     )
